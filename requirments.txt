@@ -6,4 +6,6 @@ scikit-learn>=1.1.0
 tensorflow>=2.10.0
 requests>=2.28.0
 sounddevice>=0.4.5
-scipy>=1.9.0
+spacy>=3.4.0
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.4.1/en_core_web_sm-3.4.1-py3-none-any.whl
+
