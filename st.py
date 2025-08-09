@@ -1,31 +1,25 @@
 # app.py
 """
-Interview Integrity Monitor - Streamlit app
+Interview Integrity Monitor - Streamlit app (browser mic version)
 
 Features:
-- Continuous monitoring loop (configurable interval)
-- Deepgram transcription (api key entered in sidebar)
+- Chunk-based monitoring loop controlled by Start/Stop
+- Browser microphone capture via st.audio_input
+- Deepgram transcription (API key entered in sidebar)
 - Linguistic feature extraction (spaCy) + LSTM classifier (Keras)
-- Results log (table), downloadable CSV, live read-confidence chart
+- Results log (table), downloadable CSV, live confidence chart
 - Visual alerts for repeated high-confidence "Read Speech"
 - Robust error handling & stateful session management
 """
 
 import os
-import io
 import json
-import time
-import math
 import pickle
-import threading
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import requests
-import sounddevice as sd
-from scipy.io.wavfile import write
-
 import streamlit as st
 import spacy
 from collections import Counter
@@ -36,8 +30,7 @@ from sklearn.preprocessing import StandardScaler
 # ------------------------------
 # --------------- CONFIGURATION
 # ------------------------------
-SAMPLE_RATE = 16000  # Hz
-DEFAULT_INTERVAL = 30  # seconds default recording chunk
+DEFAULT_INTERVAL = 30  # seconds default suggested chunk length
 MIN_INTERVAL = 15
 MAX_INTERVAL = 60
 
@@ -94,7 +87,7 @@ def extract_features(text, nlp):
 
     sent_lens = [len([tok for tok in sent if tok.is_alpha]) for sent in sents]
     avg_sent_len = (sum(sent_lens) / len(sent_lens)) if sent_lens else 0
-    std_sent_len = np.std(sent_lens) if len(sent_lens) > 1 else 0
+    std_sent_len = float(np.std(sent_lens)) if len(sent_lens) > 1 else 0.0
 
     content_words = [tok for tok in doc if tok.pos_ in {"NOUN", "VERB", "ADJ", "ADV"} and tok.is_alpha]
     lexical_density = len(content_words) / len(words) if words else 0
@@ -135,7 +128,9 @@ def load_scaler_with_validation():
             if os.path.exists("scaler_stats.json"):
                 with open("scaler_stats.json", "r") as f:
                     stats = json.load(f)
-                if hasattr(scaler, "mean_") and np.allclose(scaler.mean_, stats.get("mean", scaler.mean_), rtol=1e-5):
+                if hasattr(scaler, "mean_") and np.allclose(
+                    scaler.mean_, stats.get("mean", scaler.mean_), rtol=1e-5
+                ):
                     return scaler, "✅ Training scaler loaded & validated."
                 else:
                     return scaler, "⚠️ Scaler loaded (stats mismatch)."
@@ -145,46 +140,33 @@ def load_scaler_with_validation():
     except Exception as e:
         return None, f"❌ Failed to load scaler: {e}"
 
-def convert_numpy_to_wav_bytes(audio_array, sample_rate=SAMPLE_RATE):
+def get_audio_bytes_from_widget(audio_input):
     """
-    Convert float numpy audio (-1..1) to WAV bytes (16-bit).
+    Extract raw bytes and MIME type from st.audio_input UploadedFile-like object.
     """
-    buffer = io.BytesIO()
-    int16 = (audio_array * 32767).astype(np.int16)
-    write(buffer, sample_rate, int16)
-    buffer.seek(0)
-    return buffer.read()
+    if audio_input is None:
+        return None, None
+    data = audio_input.getvalue()
+    mime_type = getattr(audio_input, "type", None)
+    return data, mime_type
 
-def record_audio_block(duration, sample_rate=SAMPLE_RATE):
+def transcribe_audio_deepgram(audio_bytes, mime_type, api_key):
     """
-    Record audio via sounddevice for `duration` seconds. Returns numpy float32 array (-1..1).
-    Raises exceptions on audio device errors.
-    """
-    # sounddevice returns float32 in range -1..1 by default
-    try:
-        frames = int(duration * sample_rate)
-        audio = sd.rec(frames, samplerate=sample_rate, channels=1, dtype="float32", blocking=True)
-        return audio.flatten()
-    except Exception as e:
-        raise RuntimeError(f"Audio recording failed: {e}")
-
-def transcribe_audio_deepgram(audio_bytes, api_key):
-    """
-    Send wav bytes to Deepgram listen v1 endpoint. Returns transcript string on success.
-    Raises RuntimeError on network/api issues, including 401 for invalid key.
+    Send audio bytes to Deepgram listen v1 endpoint. Returns transcript string on success.
+    Raises RuntimeError on network/api issues.
     """
     url = "https://api.deepgram.com/v1/listen"
     headers = {
         "Authorization": f"Token {api_key}",
-        "Content-Type": "audio/wav"
+        "Content-Type": mime_type or "application/octet-stream",
     }
     params = {
         "filler_words": "true",
         "punctuate": "true",
-        "language": "en-US"
+        "language": "en-US",
     }
     try:
-        resp = requests.post(url, headers=headers, params=params, data=audio_bytes, timeout=30)
+        resp = requests.post(url, headers=headers, params=params, data=audio_bytes, timeout=60)
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Network error during transcription: {e}")
 
@@ -195,6 +177,7 @@ def transcribe_audio_deepgram(audio_bytes, api_key):
 
     try:
         result = resp.json()
+        # Deepgram standard path
         transcript = result["results"]["channels"][0]["alternatives"][0]["transcript"]
         return transcript
     except Exception as e:
@@ -205,7 +188,6 @@ def predict_speech_style(text, model, scaler, nlp):
     Extract features, scale, reshape for LSTM input, and return label, confidence, and features dict.
     Expects binary classification with model output shape (1,2) with softmax.
     """
-    # guard against empty transcript
     if not text or not text.strip():
         return "No Speech Detected", 0.0, {}
 
@@ -251,16 +233,23 @@ def append_result(transcript, prediction, confidence, features):
 def check_alerts():
     """
     Check for consecutive high-confidence 'Read Speech' and update alert_state.
-    Example rule: If two consecutive chunks are Read Speech with confidence > 0.8 => High Alert.
+    Rule: 2 consecutive 'Read Speech' with confidence > 0.8 => High Alert.
     """
     hist = st.session_state.results_history
     if len(hist) >= 2:
         last = hist[-1]
         prev = hist[-2]
-        if last["Prediction"] == "Read Speech" and prev["Prediction"] == "Read Speech" and last["Confidence"] > 0.8 and prev["Confidence"] > 0.8:
-            st.session_state.alert_state = {"level": "high", "message": "🔴 High Alert: Reading detected (2 consecutive high-confidence Read Speech)."}
+        if (
+            last["Prediction"] == "Read Speech"
+            and prev["Prediction"] == "Read Speech"
+            and last["Confidence"] > 0.8
+            and prev["Confidence"] > 0.8
+        ):
+            st.session_state.alert_state = {
+                "level": "high",
+                "message": "🔴 High Alert: Reading detected (2 consecutive high-confidence Read Speech).",
+            }
             return
-    # fallback normal
     st.session_state.alert_state = {"level": "normal", "message": "🟢 Monitoring nominal."}
 
 # ------------------------------
@@ -272,15 +261,15 @@ st.title("Interview Integrity Monitor — Read vs Spontaneous (Real-time)")
 with st.sidebar:
     st.header("Configuration")
     api_key = st.text_input("Deepgram API Key", type="password", help="Enter your Deepgram API key (not stored to disk).")
-    interval = st.slider("Recording interval (seconds)", MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL)
+    interval = st.slider("Suggested recording length (seconds)", MIN_INTERVAL, MAX_INTERVAL, DEFAULT_INTERVAL)
     st.markdown("---")
     st.write("Model & scaler files must be present in the app directory:")
-    st.write("- `speech_style_lstm_model.h5` (Keras LSTM model)")
-    st.write("- `scaler.pkl` (scikit-learn StandardScaler)")
-    st.write("- Optional: `scaler_stats.json` for validation")
+    st.write("- speech_style_lstm_model.h5 (Keras LSTM model)")
+    st.write("- scaler.pkl (scikit-learn StandardScaler)")
+    st.write("- Optional: scaler_stats.json for validation")
     st.markdown("---")
     st.write("Notes:")
-    st.write("• Use 'Start Monitoring' to begin continuous chunked recording and analysis.")
+    st.write("• Use 'Start Monitoring' to begin chunked recording and analysis.")
     st.write("• After stopping, you can download the session CSV.")
 
 # ------------------------------
@@ -317,29 +306,27 @@ controls = st.container()
 with controls:
     col1, col2 = st.columns([1, 1])
     with col1:
-        start_clicked = st.button("▶️ Start Monitoring", disabled=st.session_state.monitoring_active or not st.session_state.model_loaded or not api_key)
+        start_clicked = st.button(
+            "▶️ Start Monitoring",
+            disabled=st.session_state.monitoring_active or not st.session_state.model_loaded or not api_key,
+        )
     with col2:
         stop_clicked = st.button("⏹️ Stop Monitoring", disabled=not st.session_state.monitoring_active)
 
-    # start/stop logic
     if start_clicked:
         st.session_state.monitoring_active = True
-        st.session_state.processing_chunk = False  # allow first chunk
+        st.session_state.processing_chunk = False
         st.success("Monitoring started.")
-        # reset counters/history for a fresh session if empty
-        # (if you want to append across sessions, remove clearing)
+        # reset counters/history for a fresh session
         st.session_state.results_history = []
         st.session_state.chunk_counter = 0
         st.session_state.alert_state = {"level": "normal", "message": "🟡 Monitoring started."}
-        # rerun to update UI
-        st.experimental_rerun()
+        st.rerun()
 
     if stop_clicked:
         st.session_state.monitoring_active = False
         st.session_state.processing_chunk = False
         st.success("Monitoring stopped.")
-        # After stopping, leave data in results_history, allow download
-        # No automatic rerun necessary — UI updates below.
 
 # ------------------------------
 # --------------- LIVE DISPLAY AREAS
@@ -371,43 +358,30 @@ with right_col:
 # ------------------------------
 # --------------- MONITORING LOOP (single-chunk-per-run pattern)
 # ------------------------------
-# Important pattern:
-# - We process exactly one chunk per Streamlit run when monitoring_active==True.
-# - After finishing a chunk, we call st.experimental_rerun() so the UI can react to button clicks (Start/Stop).
-# - Recording itself blocks for `interval` seconds (that's the "real-time" chunking).
 if st.session_state.monitoring_active:
-    # disable Start button by UI state (done above)
     st.session_state.processing_chunk = True
+    st.info(f"Monitoring active — please record ~{interval} seconds per chunk. Press ⏹️ Stop to end session.")
 
-    # show a small status box about active monitoring
-    st.info(f"Monitoring active — recording chunks every {interval} s. Press ⏹️ Stop to end session.")
+    # Show mic widget to capture one chunk
+    audio_value = st.audio_input(f"Record chunk #{st.session_state.chunk_counter + 1} (aim for ~{interval}s)")
+    proceed = st.button("Process Recorded Chunk", disabled=(audio_value is None))
 
-    try:
-        # RECORD CHUNK
-        with st.spinner(f"Recording chunk #{st.session_state.chunk_counter + 1} for {interval} seconds..."):
-            try:
-                audio_np = record_audio_block(interval, SAMPLE_RATE)
-            except Exception as e:
-                # fatal recording error: stop monitoring
-                st.error(f"Recording failed: {e}")
-                st.session_state.monitoring_active = False
-                st.session_state.processing_chunk = False
-                st.experimental_rerun()
-
-        # convert to wav bytes for Deepgram
+    if proceed:
         try:
-            wav_bytes = convert_numpy_to_wav_bytes(audio_np, SAMPLE_RATE)
+            audio_bytes, mime_type = get_audio_bytes_from_widget(audio_value)
+            if not audio_bytes:
+                raise RuntimeError("No audio captured. Please record again.")
         except Exception as e:
-            st.error(f"Audio conversion failed: {e}")
+            st.error(f"Audio capture failed: {e}")
             st.session_state.processing_chunk = False
-            st.experimental_rerun()
+            st.rerun()
 
         # TRANSCRIBE
         transcript = ""
         try:
             if not api_key:
                 raise RuntimeError("No Deepgram API key provided in sidebar.")
-            transcript = transcribe_audio_deepgram(wav_bytes, api_key)
+            transcript = transcribe_audio_deepgram(audio_bytes, mime_type, api_key)
             if transcript is None:
                 transcript = ""
         except Exception as e:
@@ -419,7 +393,9 @@ if st.session_state.monitoring_active:
         # PREDICT
         try:
             if transcript and not transcript.startswith("[Transcription error"):
-                label, confidence, features = predict_speech_style(transcript, st.session_state.model, st.session_state.scaler, st.session_state.nlp)
+                label, confidence, features = predict_speech_style(
+                    transcript, st.session_state.model, st.session_state.scaler, st.session_state.nlp
+                )
             else:
                 # empty or error transcript is treated as "No Speech Detected"
                 label, confidence, features = "No Speech Detected", 0.0, {}
@@ -433,12 +409,9 @@ if st.session_state.monitoring_active:
         # update alert checks
         check_alerts()
 
-        # Update UI displays (table, transcript area, chart, alert)
-        # We'll allow the normal flow at the top re-render to render history.
-        # But also show latest chunk details now.
+        # Update UI displays
         details_placeholder.markdown("**Latest chunk**")
         details_placeholder.text_area("Transcript (latest)", value=transcript, height=200)
-        last_row = st.session_state.results_history[-1] if st.session_state.results_history else None
 
         # display alert box with color
         if st.session_state.alert_state["level"] == "high":
@@ -446,25 +419,15 @@ if st.session_state.monitoring_active:
         else:
             alert_box.success(st.session_state.alert_state["message"])
 
-        # chart: plot Read Speech confidence over time (we extract the 'Read Speech' confidence)
+        # chart: plot confidence over time
         hist_df = pd.DataFrame(st.session_state.results_history)
-        # ensure numeric
         if not hist_df.empty:
-            # make a numeric list for confidence (use Confidence directly)
             chart_series = hist_df[["Chunk #", "Confidence"]].set_index("Chunk #")
             chart_box.line_chart(chart_series)
 
-        # after finishing one chunk, allow another chunk by rerunning the app.
-        # This approach keeps the UI responsive to Stop button presses.
         st.session_state.processing_chunk = False
-        # Re-run script to allow user to click Stop button or continue (Start remains disabled).
-        st.experimental_rerun()
+        st.rerun()
 
-    except Exception as e:
-        st.error(f"Unexpected monitoring error: {e}")
-        st.session_state.monitoring_active = False
-        st.session_state.processing_chunk = False
-        st.experimental_rerun()
 else:
     # Monitoring not active: show summary / download if available
     if st.session_state.results_history:
@@ -482,7 +445,7 @@ else:
         if st.session_state.alert_state["level"] == "high":
             alert_box.error(st.session_state.alert_state["message"])
         else:
-            alert_box.info(st.session_state.alert_state["message"])
+            alert_box.info(st.session_state.alert_state.get("message", "Idle."))
 
         # Download button for CSV
         csv = df.to_csv(index=False).encode("utf-8")
@@ -496,7 +459,7 @@ else:
 # ------------------------------
 st.markdown("---")
 st.write("Technical notes:")
-st.write("- The app records blocking chunks of `interval` seconds — recording time equals wall-clock monitoring time.")
-st.write("- The 'single-chunk-per-run' pattern lets Streamlit stay responsive to the Stop button between chunks.")
-st.write("- If you wish to run the recorder on a separate thread (more advanced), ensure careful thread-safe updates to `st.session_state`.")
-st.write("- If microphone is not available or permission denied the app will display an error and stop monitoring.")
+st.write("- Recording is done in the browser using st.audio_input; the server has no direct mic access.")
+st.write("- The 'single-chunk-per-run' pattern keeps the UI responsive between chunks.")
+st.write("- Deepgram accepts multiple audio formats (webm, wav, mp3, etc.) from the browser.")
+st.write("- If microphone permission is denied, the audio_input widget will show an error.")
